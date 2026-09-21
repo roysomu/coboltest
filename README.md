@@ -8,10 +8,13 @@ words or lines, delete words or lines, and save your changes.
 
 ## Build and run
 
-Requires **JDK 17** (tested with OpenJDK 17.0.20), **Apache Maven 3.8.x or
-later** (tested with Maven 3.9.16), and macOS or Linux. JDK 21 and 25 also
-build the project because the compiler targets release 17. Python 3.7 or later
-is needed only for the automated tests.
+Requires **JDK 17 at patch level 17.0.20.1 or later**, **Apache Maven 3.8.x or
+later** (tested with Maven 3.9.16), and macOS or Linux. `17.0.20.1+1` is the
+current Java 17 security baseline, published in the August 2026 critical
+security patch update; earlier Java 17 builds, `17.0.20` among them, are
+missing its fixes. JDK 21 and 25 also build the project, each at its own
+current patch level, because the compiler targets release 17. Python 3.7 or
+later is needed only for the automated tests.
 
 Install the toolchain on macOS. Homebrew's Maven depends on an unversioned
 `openjdk` formula, so `JAVA_HOME` has to point at JDK 17; otherwise Maven runs
@@ -32,8 +35,8 @@ sudo apt-get update
 sudo apt-get install openjdk-17-jdk-headless maven
 ```
 
-Check the versions first; expect `17.0.x` from the JDK and `3.8.x` or later
-from Maven:
+Check the versions first; expect `17.0.20.1` or later from the JDK and `3.8.x`
+or later from Maven:
 
 ```sh
 java -version
@@ -42,8 +45,14 @@ mvn -version
 
 `mvn -version` also prints a `Java version:` line for the JDK Maven itself
 runs on, which need not be the first `java` on your path. It has to name the
-JDK you mean to build with: `17.0.x` for the tested toolchain. If it names
-another JDK, export `JAVA_HOME` as shown above and check again.
+JDK you mean to build with, at the same `17.0.20.1` or later baseline, because
+Maven resolves the build plugins over TLS on that JDK. If it names another
+JDK, export `JAVA_HOME` as shown above and check again.
+
+An older `17.0.x` build still compiles and runs the project, but it lacks the
+August 2026 security fixes, so install a `17.0.20.1` or later build first:
+Homebrew's `temurin@17` cask and the Debian/Ubuntu `openjdk-17-jdk-headless`
+package both carry it once the package index is current.
 
 From this directory:
 

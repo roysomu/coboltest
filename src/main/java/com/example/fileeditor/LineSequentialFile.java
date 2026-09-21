@@ -7,24 +7,32 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AccessDeniedException;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.security.SecureRandom;
+import java.util.Set;
 
 /**
  * Line-sequential file primitives for the Java port of {@code file_editor.cob}.
  * This is the only class of the program that performs file-content I/O and
  * filesystem mutation - open, read, write, close, temporary-file creation,
  * atomic replace and delete - so every GnuCOBOL line-sequential rule and every
- * POSIX save primitive is implemented exactly once, here. The one other
- * {@code java.nio.file} use in the program is {@link FileEditor}'s path
- * conversion: it decodes the operator's path bytes into a
- * {@link java.nio.file.Path} and passes that in, without opening, reading,
- * writing or removing anything itself.
+ * POSIX save primitive is implemented exactly once, here. {@link FileEditor}
+ * decodes the operator's path bytes into a {@link java.nio.file.Path} and
+ * passes it in; it opens, reads, writes and removes nothing itself.
  *
  * <p>Reproduces:</p>
  * <ul>
@@ -41,29 +49,28 @@ import java.nio.file.StandardOpenOption;
  *
  * <p>The behavioral oracle is that program compiled with GnuCOBOL 3.2.0 under
  * its default runtime configuration ({@code COB_LS_VALIDATE=yes},
- * {@code COB_LS_SPLIT=yes}). Several observable rules are supplied by that
- * runtime rather than by the COBOL source; each was measured against it and is
- * made explicit here:</p>
+ * {@code COB_LS_SPLIT=yes}), which supplies rules the COBOL source does not
+ * spell out. Each member states the rules it implements; the two that shape the
+ * class as a whole are deliberately asymmetric:</p>
  * <ul>
- *   <li><b>Reading.</b> {@code LF} (0x0A) delimits records and is never part of
- *       one. A {@code CR} (0x0D) immediately followed by {@code LF} belongs to
- *       the delimiter and is discarded; a {@code CR} anywhere else in a record
- *       is data and therefore fails the control-byte test. An unterminated
- *       final record is still a record. A record longer than
- *       {@link #RECORD_SIZE} bytes, or a file whose final byte is a bare
- *       {@code CR}, yields status {@code 06}. A retained record byte in
- *       0x00-0x1F other than BS, TAB, FF, SI or ESC yields status {@code 09}.
- *       Bytes 0x7F-0xFF are ordinary data.</li>
- *   <li><b>Writing.</b> A line containing any byte in 0x00-0x1F - TAB included,
- *       with no exemptions - yields status {@code 71} and no byte of that
- *       record is emitted. Otherwise the line is written with its trailing
- *       spaces removed, terminated by a single {@code LF}. Bytes 0x7F-0xFF are
- *       written unchanged.</li>
+ *   <li><b>Reading</b> ({@link Input#readRecord()}) judges length before
+ *       content. {@code LF} (0x0A) delimits records and is never part of one,
+ *       and a {@code CR} (0x0D) immediately before it belongs to that
+ *       delimiter. A record longer than {@link #RECORD_SIZE} bytes, or a file
+ *       whose final byte is a bare {@code CR}, yields status {@code 06}; only a
+ *       record within that limit is scanned for control bytes, which yield
+ *       status {@code 09}. A {@code CR} anywhere else inside a record is data
+ *       and so fails that scan - but it yields {@code 09} only where the record
+ *       has not already yielded {@code 06}.</li>
+ *   <li><b>Writing</b> ({@link Output#writeRecord(String)}) accepts no control
+ *       byte at all, TAB included, so a line holding one is refused with status
+ *       {@code 71} and none of it is emitted.</li>
  * </ul>
  *
  * <p>Every byte-to-char and char-to-byte conversion uses ISO-8859-1, so one
  * {@code char} is one byte and {@code String.length()} is a byte count exactly
- * as the original {@code PIC X} fields counted bytes.</p>
+ * as the original {@code PIC X} fields counted bytes. Bytes 0x7F-0xFF are
+ * ordinary data in both directions.</p>
  *
  * <p>Failures are communicated only by throwing. {@link FileStatusException}
  * carries the two-character {@code io-status} value the caller displays; a bare
@@ -80,8 +87,7 @@ final class LineSequentialFile {
      * the caller, whose own width check rejects it; only a longer record is
      * refused here with status {@code 06}. A {@code CR} that turns out to
      * belong to a {@code CRLF} delimiter never occupies one of these bytes;
-     * {@link Input#readRecord()} documents that accounting and why it differs
-     * from the plan's pseudocode.
+     * {@link Input#readRecord()} documents that accounting.
      */
     static final int RECORD_SIZE = 1025;
 
@@ -97,35 +103,61 @@ final class LineSequentialFile {
     /** File not found on {@code OPEN INPUT}; drives the "Create it?" flow. */
     private static final String STATUS_FILE_NOT_FOUND = "35";
 
-    /** Permission denied on {@code OPEN INPUT}. */
     private static final String STATUS_PERMISSION_DENIED = "37";
 
-    /** Record the line-sequential writer refuses to write. */
     private static final String STATUS_INVALID_WRITE_DATA = "71";
 
     /** Mask that widens a signed {@code byte} to its 0x00-0xFF value. */
     private static final int BYTE_MASK = 0xFF;
 
-    /** Record delimiter. */
     private static final int LINE_FEED = 0x0A;
 
     /** Delimiter prefix when it immediately precedes {@link #LINE_FEED}. */
     private static final int CARRIAGE_RETURN = 0x0D;
 
-    /** First non-control byte; everything below it is a control byte. */
     private static final int FIRST_PRINTABLE_BYTE = 0x20;
 
-    /** The only byte trailing-space removal strips, on write. */
     private static final char SPACE = ' ';
 
     /**
      * Fixed part of the temporary file name. The COBOL template was
      * {@code <path>.tmp.XXXXXX} [file_editor.cob:466]; the six random
-     * characters become the digits {@code Files.createTempFile} appends.
+     * characters {@code mkstemp} substituted become the decimal digits of a
+     * random {@code long}, so the name still has the {@code *.tmp.*} shape a
+     * residue check looks for.
      */
     private static final String TEMP_INFIX = ".tmp.";
 
-    /** Holder of nested types and static primitives; never instantiated. */
+    /**
+     * Exclusive, link-refusing create of the temporary file:
+     * {@code O_CREAT | O_EXCL | O_NOFOLLOW}. A name that already exists - a
+     * planted file or symbolic link - is refused rather than opened.
+     */
+    private static final Set<OpenOption> TEMP_OPEN_OPTIONS = Set.of(
+            StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE,
+            LinkOption.NOFOLLOW_LINKS);
+
+    /**
+     * Mode {@code 0600} as {@code mkstemp} gave it [file_editor.cob:467],
+     * applied by the create itself so the file is never briefly readable by
+     * anyone else. Empty, never mutated, on a filesystem with no POSIX
+     * permission view, which would reject the attribute.
+     */
+    private static final FileAttribute<?>[] TEMP_ATTRIBUTES =
+            FileSystems.getDefault().supportedFileAttributeViews().contains("posix")
+                    ? new FileAttribute<?>[] {PosixFilePermissions.asFileAttribute(
+                            PosixFilePermissions.fromString("rw-------"))}
+                    : new FileAttribute<?>[0];
+
+    /** Distinct temporary names tried before the create is reported as failed. */
+    private static final int TEMP_NAME_ATTEMPTS = 100;
+
+    /**
+     * Source of the temporary names. A guessable name can be occupied in
+     * advance, which is why these are not predictable.
+     */
+    private static final SecureRandom TEMP_NAMES = new SecureRandom();
+
     private LineSequentialFile() {
     }
 
@@ -229,47 +261,38 @@ final class LineSequentialFile {
          * <p>The reader is bounded: at most {@link #RECORD_SIZE} bytes are
          * retained, and bytes beyond that are consumed and discarded while only
          * setting a saturating over-limit flag. The whole physical line is
-         * always consumed, so the next call starts at the next record.</p>
+         * always consumed, so the next call starts at the next record and an
+         * arbitrarily long line costs constant memory. A final record that end
+         * of file cuts short, with no {@code LF} of its own, is still a
+         * record.</p>
          *
          * <p>A {@code CR} is held <em>pending</em> rather than stored: if the
          * next byte is {@code LF} the pending {@code CR} is part of the
          * delimiter and is discarded without ever counting toward the record
          * length; if the next byte is anything else the pending {@code CR} is
          * flushed into the record as data, where the control-byte scan below
-         * refuses it with status {@code 09}. The flush happens exactly once,
+         * refuses it. The flush happens exactly once,
          * before the byte that ended the hold is classified, so a run of
          * {@code CR} bytes stores all but its last one and that last one faces
          * the same {@code LF} test as any other held {@code CR}.</p>
          *
-         * <p>Holding the {@code CR} outside the record area is deliberately
-         * <em>not</em> the formulation AAP sections 0.5.2 and 0.7.5 write out,
-         * which retains the {@code CR} in the {@link #RECORD_SIZE} buffer like
-         * any other byte and strips it again when {@code LF} arrives. That
-         * formulation is not reproduced because it reports status {@code 06}
-         * one byte early: after a line of {@link #RECORD_SIZE} data bytes the
-         * {@code CR} is the byte that overflows the buffer and sets the
-         * over-limit flag, and because its removal at {@code LF} is itself
-         * conditional on that flag being clear, the flag survives to the
-         * finish sequence and becomes {@code 06}. AAP section 0.1.1 makes the
-         * GnuCOBOL 3.2.0 oracle authoritative over the plan's pseudocode, and
-         * the oracle was measured as:</p>
-         * <ul>
-         *   <li>{@link #RECORD_SIZE} data bytes then {@code CRLF} - the record
-         *       is returned and the caller reports {@code File exceeds 1000
-         *       lines or 1024 characters per line.}, not {@code 06};</li>
-         *   <li>1,024 {@code x} then one space then {@code CRLF}, also
-         *       {@link #RECORD_SIZE} data bytes - the file opens, the stored
-         *       line being 1,024 bytes once trailing spaces are removed;</li>
-         *   <li>{@code 06} appears only from {@link #RECORD_SIZE} + 1 data
-         *       bytes upward, with or without a trailing {@code CR};</li>
-         *   <li>a file whose final byte is a bare {@code CR} yields {@code 06},
-         *       while a {@code CR} anywhere else inside a record yields
-         *       {@code 09}.</li>
-         * </ul>
+         * <p>Because a delimiter {@code CR} never occupies a record byte, the
+         * length boundary is the same for {@code LF} and {@code CRLF} files.
+         * {@link #RECORD_SIZE} data bytes are returned rather than refused, and
+         * it is the caller's own 1,024-byte width check that rejects them with
+         * {@code File exceeds 1000 lines or 1024 characters per line.}
+         * [file_editor.cob:192-197]; {@link #RECORD_SIZE} + 1 data bytes are
+         * the first to yield status {@code 06} here. A line of 1,024 {@code x}
+         * followed by one space is {@link #RECORD_SIZE} bytes and therefore
+         * opens, the caller storing it as 1,024 bytes once trailing spaces are
+         * removed.</p>
          *
-         * <p>Those four outcomes are what this method produces, and they are
-         * what AAP section 0.5.2's own prose describes; only its pseudocode
-         * disagrees.</p>
+         * <p>The finish sequence fixes the precedence of the two statuses: the
+         * over-limit {@code 06} is raised first, then the {@code 06} for a file
+         * whose final byte is a bare {@code CR}, and only a record within the
+         * limit is scanned byte by byte. An embedded {@code CR}, or any other
+         * unacceptable control byte, therefore yields {@code 09} only where the
+         * record has not already yielded {@code 06}.</p>
          *
          * @return the record without its delimiter, the empty string for a blank
          *         line, or {@code null} at end of file with nothing consumed -
@@ -279,8 +302,8 @@ final class LineSequentialFile {
          *                             longer than {@link #RECORD_SIZE} bytes or
          *                             the file's final byte is a bare
          *                             {@code CR}; status {@code 09} when a
-         *                             retained byte is an unacceptable control
-         *                             byte
+         *                             record within that limit retains an
+         *                             unacceptable control byte
          * @throws IOException the underlying read failed; the caller maps this
          *                     to status {@code 30}
          */
@@ -368,32 +391,72 @@ final class LineSequentialFile {
      * The caller closes this explicitly rather than through try-with-resources
      * so that its diagnostics appear in COBOL source order; {@link #close()} is
      * therefore safe to call after a refused or failed write.</p>
+     *
+     * <p>The instance owns the single open handle on the temporary file that
+     * {@link LineSequentialFile#createTemp(Path)} obtained when it created the
+     * file, and every record is written through that handle. The temporary is
+     * never opened a second time by name, so the name cannot be substituted
+     * between the create and the writes; {@link #path()} is used only for the
+     * rename that completes the save and the removal that cleans up after a
+     * failure.</p>
      */
     static final class Output implements Closeable {
 
+        /** The temporary file this writes to. */
+        private final Path path;
+
+        /**
+         * The handle the file was created with, held until {@link #close()}
+         * releases it: what keeps the writes on the file that was created.
+         */
+        private final FileChannel channel;
+
+        /** Buffered record writer over {@link #channel}; closing it closes the channel. */
         private final OutputStream out;
 
-        private Output(OutputStream out) {
-            this.out = out;
+        private Output(Path path, FileChannel channel) {
+            this.path = path;
+            this.channel = channel;
+            this.out = new BufferedOutputStream(Channels.newOutputStream(channel));
+        }
+
+        /**
+         * @return the temporary file's path, for the rename that completes the
+         *         save [file_editor.cob:500-503] and the removal that cleans up
+         *         after a failure [file_editor.cob:512-514]
+         */
+        Path path() {
+            return path;
         }
 
         /**
          * {@code OPEN OUTPUT text-file} on the temporary file
-         * [file_editor.cob:479-482]. The temporary already exists - it was
-         * created by {@link LineSequentialFile#createTemp(Path)} - so the file
-         * is opened for writing and truncated, never created here.
+         * [file_editor.cob:479-482], performed on the retained handle rather
+         * than by reopening the name.
          *
-         * @param temp the temporary file created by
-         *             {@link LineSequentialFile#createTemp(Path)}
-         * @return an open writer positioned at the start of the file
-         * @throws IOException the file could not be opened for writing; the
+         * <p>{@code OPEN OUTPUT} presents an empty file positioned at its
+         * start; the exclusive create already produced one, so the truncation
+         * has nothing to remove and is instead the check that the handle is
+         * open and writable - the one way this step can still fail. Such a
+         * failure releases the handle before it propagates, so a save that
+         * never got a writer leaks nothing.</p>
+         *
+         * @throws IOException the retained handle cannot be written to; the
          *                     caller maps this to
          *                     {@code Cannot open temporary file. File status: 30}
          */
-        static Output open(Path temp) throws IOException {
-            return new Output(new BufferedOutputStream(Files.newOutputStream(
-                    temp, StandardOpenOption.WRITE,
-                    StandardOpenOption.TRUNCATE_EXISTING)));
+        void open() throws IOException {
+            try {
+                channel.truncate(0);
+            } catch (IOException | RuntimeException e) {
+                try {
+                    out.close();
+                } catch (IOException | RuntimeException ignored) {
+                    // The open has already failed; the caller reports that and
+                    // removes the temporary file.
+                }
+                throw e;
+            }
         }
 
         /**
@@ -439,13 +502,13 @@ final class LineSequentialFile {
          * <p>Closing the buffered stream is the whole operation: it flushes the
          * bytes still held in the buffer, so a failure to reach the disk
          * surfaces here as an {@link IOException} rather than being lost, and
-         * it releases the underlying descriptor <em>even when that flush
-         * fails</em>. Flushing in a separate statement beforehand would skip
-         * the close on exactly that failure and leak the descriptor of every
-         * save that failed.</p>
+         * it closes the retained handle <em>even when that flush fails</em>.
+         * Flushing in a separate statement beforehand would skip the close on
+         * exactly that failure and leak the handle of every save that
+         * failed.</p>
          *
          * @throws IOException the flush performed by the close, or the close
-         *                     itself, failed; the descriptor has been released
+         *                     itself, failed; the handle has been released
          *                     either way
          */
         @Override
@@ -455,17 +518,29 @@ final class LineSequentialFile {
     }
 
     /**
-     * Creates the unique, private temporary file the save writes into,
-     * replacing {@code call static "mkstemp"} over the template
-     * {@code <path>.tmp.XXXXXX} [file_editor.cob:464-474].
+     * Creates the unique, private temporary file the save writes into and
+     * returns the writer that owns its one open handle, replacing
+     * {@code call static "mkstemp"} over the template
+     * {@code <path>.tmp.XXXXXX} together with the {@code close} of the
+     * descriptor it returned [file_editor.cob:464-477].
      *
-     * <p>{@code Files.createTempFile} creates the file exclusively and, on a
-     * POSIX filesystem, with mode {@code 0600}; an empty suffix (not
-     * {@code null}, which would append {@code .tmp}) yields
-     * {@code <name>.tmp.<digits>}. The file is always a sibling of the
-     * destination in the destination's own directory, so the later rename is
-     * never across filesystems, and it matches the {@code *.tmp.*} shape the
-     * acceptance suite looks for.</p>
+     * <p>The file is always a sibling of the destination in the destination's
+     * own directory, named {@code <name>.tmp.<digits>} after 64 random bits,
+     * so the rename that completes the save is never across filesystems and
+     * the name has the {@code *.tmp.*} shape the acceptance suite looks for.
+     * The mode is {@code 0600}, as {@code mkstemp} gave it.</p>
+     *
+     * <p>Creating the file and opening it are one operation, and the handle it
+     * yields is the one every record is written through. The original instead
+     * closed {@code mkstemp}'s descriptor and reopened the name
+     * [file_editor.cob:474,479], which left a window: anyone else able to
+     * write to the destination directory could unlink the temporary and leave
+     * a symbolic link under that name, and the reopen would follow it and
+     * truncate whatever it pointed at. {@link #TEMP_OPEN_OPTIONS} refuses both
+     * a name that already exists and a link that appears at that instant, and
+     * {@link #TEMP_ATTRIBUTES} makes {@code 0600} part of the create. A name
+     * already taken is not an error: another is tried, up to
+     * {@link #TEMP_NAME_ATTEMPTS} of them.</p>
      *
      * <p>A missing destination directory fails here exactly as {@code mkstemp}
      * did, with a {@code NoSuchFileException}: no directory is created and no
@@ -477,13 +552,15 @@ final class LineSequentialFile {
      * exception escape.</p>
      *
      * @param target the destination file the save will replace
-     * @return the newly created temporary sibling of {@code target}
-     * @throws IOException the temporary file could not be created; the caller
+     * @return a writer owning the newly created private temporary sibling of
+     *         {@code target}; the caller closes it and reads
+     *         {@link Output#path()} for the rename and the cleanup
+     * @throws IOException no temporary file could be created; the caller
      *                     reports {@code Cannot create a temporary file. Check
      *                     the path and directory permissions.}, leaves the
      *                     document unsaved and touches nothing on disk
      */
-    static Path createTemp(Path target) throws IOException {
+    static Output createTemp(Path target) throws IOException {
         Path abs = target.toAbsolutePath();
         Path parent = abs.getParent();
         Path name = abs.getFileName();
@@ -491,7 +568,20 @@ final class LineSequentialFile {
             throw new IOException(
                     "no sibling temporary file can be created for " + abs);
         }
-        return Files.createTempFile(parent, name.toString() + TEMP_INFIX, "");
+        String prefix = name.toString() + TEMP_INFIX;
+        FileAlreadyExistsException taken = null;
+        for (int attempt = 0; attempt < TEMP_NAME_ATTEMPTS; attempt++) {
+            Path temp = parent.resolve(
+                    prefix + Long.toUnsignedString(TEMP_NAMES.nextLong()));
+            try {
+                return new Output(temp,
+                        FileChannel.open(temp, TEMP_OPEN_OPTIONS, TEMP_ATTRIBUTES));
+            } catch (FileAlreadyExistsException occupied) {
+                taken = occupied;
+            }
+        }
+        throw new IOException(TEMP_NAME_ATTEMPTS
+                + " temporary file names were already taken in " + parent, taken);
     }
 
     /**
@@ -504,6 +594,13 @@ final class LineSequentialFile {
      * which case the caller reports
      * {@code Cannot replace destination. Changes remain unsaved.} and the
      * document stays dirty.</p>
+     *
+     * <p>The temporary is closed by the time this runs, and this is the one
+     * step of the save that names it rather than using its handle, because
+     * renaming is offered on paths only - here as in the C library the original
+     * called. Nothing is written through the name, so the worst a substitution
+     * under it could do is fail this call or publish the substitute; it cannot
+     * write through a link into a file of the attacker's choosing.</p>
      *
      * @param temp   the temporary file holding the saved document
      * @param target the destination to replace
@@ -530,8 +627,6 @@ final class LineSequentialFile {
         try {
             Files.deleteIfExists(p);
         } catch (IOException | RuntimeException ignored) {
-            // Cleanup is best effort; the caller is already reporting why the
-            // save failed and must keep exit status 0 with an empty stderr.
         }
     }
 

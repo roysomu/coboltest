@@ -29,56 +29,14 @@ import java.util.Random;
  * <p><b>Equivalence boundary.</b> The behavior reproduced is that of the
  * original compiled with GnuCOBOL 3.2.0 under its default runtime and driven
  * through standard input and output: the transcript, every operator-visible
- * string, every limit, the exit status, the bytes written to disk and the
- * side effects on the filesystem. The authority on what may differ is the
- * divergence register of the conversion plan (section 0.5.4), whose approved
- * exceptions D1 to D8 are listed in full below; a difference that is not one
- * of them is a defect rather than a design choice.</p>
- * <ul>
- *   <li><b>D1 - filename mapping.</b> The path the operator types is used
- *       literally, always. The original's COBOL runtime mapped a bare name
- *       that matched an environment variable to that variable's value and
- *       prefixed relative names with {@code COB_FILE_PATH}; that is runtime
- *       configuration rather than program logic, and it is deliberately not
- *       reproduced - nothing in this program reads an environment
- *       variable.</li>
- *   <li><b>D2 - temporary file suffix.</b> The six random alphanumerics
- *       {@code mkstemp} substitutes for the {@code XXXXXX} of
- *       {@code <path>.tmp.XXXXXX} [file_editor.cob:465-468] become the
- *       decimal digits {@code Files.createTempFile} appends. Both are
- *       exclusive, private (0600) {@code <name>.tmp.*} siblings in the
- *       destination directory, so a residue check over that glob sees the
- *       same thing.</li>
- *   <li><b>D3 - random word sequence.</b> A fresh {@link Random} replaces
- *       {@code FUNCTION RANDOM} seeded from {@code ACCEPT ... FROM TIME}
- *       [file_editor.cob:89-90,345-346]. The sequence differs run to run in
- *       both implementations; the uniform choice over the twenty
- *       {@link #VOCABULARY} entries is preserved.</li>
- *   <li><b>D4 - storage layout.</b> One heap list bounded at
- *       {@link #MAX_LINES} entries replaces the two preallocated
- *       1,000 x 1,024-byte tables [file_editor.cob:20-23]. The capacity and
- *       width bounds are enforced by the same explicit checks at the same
- *       values, so only the memory footprint differs.</li>
- *   <li><b>D5 - flushing.</b> Every write is flushed immediately instead of
- *       being buffered by the C runtime when standard output is a pipe. The
- *       bytes are identical and only the timing differs, which is what makes
- *       a prompt appear before the program blocks on input.</li>
- *   <li><b>D6 - I/O status set.</b> For operating-system failures only the
- *       statuses reachable without fault injection are produced - {@code 35}
- *       not found, {@code 37} permission denied and {@code 30} for any other
- *       failure - whereas the data-validation statuses {@code 06},
- *       {@code 09} and {@code 71} are reproduced exactly.</li>
- *   <li><b>D7 - unrepresentable paths.</b> A path whose bytes the filesystem
- *       charset cannot represent, and a path containing a NUL byte, are
- *       refused with {@code Invalid file path.} instead of being handed to
- *       the C library; see {@link #toPath(String)}.</li>
- *   <li><b>D8 - exit status.</b> The status is {@code 0} on every path, which
- *       is the oracle's behavior and the process contract stated below; a
- *       non-3.x COBOL toolchain leaked a non-zero status from the
- *       failed-temporary-file path.</li>
- * </ul>
- * <p>The banner {@code COBOL Text File Editor} [file_editor.cob:91] is part
- * of the transcript and is therefore kept verbatim.
+ * string, every limit, the exit status, the bytes written to disk and the side
+ * effects on the filesystem. The banner {@code COBOL Text File Editor}
+ * [file_editor.cob:91] is part of that transcript and is therefore kept
+ * verbatim. Where this port differs from that behavior deliberately, the
+ * difference is documented at the member that makes it - {@link #lines},
+ * {@link #random} and {@link #toPath(String)} here, and the corresponding
+ * notes in {@link Console} and {@link LineSequentialFile}; a difference
+ * documented nowhere is a defect rather than a design choice.
  *
  * <p><b>Byte semantics.</b> Every byte of input, output and file content is
  * mapped through ISO-8859-1 by {@link Console} and {@link LineSequentialFile},
@@ -94,7 +52,9 @@ import java.util.Random;
  * {@code System.exit}. Nothing in the program writes to {@code System.err}:
  * every anticipated failure is reported to the operator on standard output as
  * the original reported it, and a failed operation leaves both the in-memory
- * document and the file on disk untouched.
+ * document and the file on disk untouched. The program takes no arguments and
+ * reads no environment variable and no configuration file; the path the
+ * operator types is the path that is used, with no substitution of any kind.
  *
  * <p>The class is single-threaded by construction: one instance is created by
  * {@link #main(String[])}, it owns the only {@link Console}, and no state is
@@ -204,7 +164,6 @@ public final class FileEditor {
      */
     private final Random random = new Random();
 
-    /** The program's only terminal boundary; see {@link Console}. */
     private final Console console = new Console();
 
     /**
@@ -280,9 +239,6 @@ public final class FileEditor {
                     openDocument();
                     break;
                 case "Q":
-                    // Quitting is abandoned when the unsaved-changes check
-                    // cancels it, including when the save it performed failed
-                    // [file_editor.cob:106-108,147-149].
                     if (!checkUnsaved()) {
                         done = true;
                     }
@@ -296,13 +252,9 @@ public final class FileEditor {
                 case "8":
                 case "9":
                 case "S":
-                    // The grouped WHENs [file_editor.cob:109-110]: every option
-                    // that needs a document shares one gate.
                     if (!opened) {
                         console.println("Open or create a file first (option 1).");
                     } else {
-                        // The nested EVALUATE [file_editor.cob:114-123] has no
-                        // WHEN OTHER, so this switch needs no default.
                         switch (choice) {
                             case "2":
                                 viewDocument();
@@ -385,8 +337,6 @@ public final class FileEditor {
         String answer = asciiUpper(trimSpaces(readAnswer()));
         if (answer.equals("S")) {
             saveDocument();
-            // A save that failed leaves the document dirty, which cancels the
-            // quit or the file switch rather than losing the changes.
             return dirty;
         }
         if (answer.equals("D")) {
@@ -420,9 +370,6 @@ public final class FileEditor {
         }
         console.print("Text file path (up to 512 characters): ");
         String path = trimSpaces(readAnswer());
-        // An all-space answer trims to the empty string, which is the
-        // `function trim(answer) = spaces` test [file_editor.cob:160]; the
-        // length test counts bytes [file_editor.cob:161].
         if (path.isEmpty() || path.length() > MAX_PATH) {
             console.println("Invalid file path.");
             return;
@@ -436,7 +383,6 @@ public final class FileEditor {
         try {
             input = LineSequentialFile.Input.open(target);
         } catch (LineSequentialFile.FileStatusException status) {
-            // `evaluate io-status` after OPEN INPUT [file_editor.cob:167-184].
             if ("35".equals(status.status)) {
                 console.print("File does not exist. Create it? (Y/N): ");
                 // Whole-string comparison, as in the original: `Y   x` is not
@@ -448,8 +394,6 @@ public final class FileEditor {
                     dirty = true;
                     console.println("New document ready. Use S to save it.");
                 }
-                // Declining prints nothing and changes nothing
-                // [file_editor.cob:178-179].
                 return;
             }
             console.println("Cannot open file. File status: " + status.status);
@@ -458,13 +402,10 @@ public final class FileEditor {
         List<String> pending = new ArrayList<>();
         boolean eof = false;
         boolean failed = false;
-        // `perform until eof-flag = 1 or failed-flag = 1`
-        // [file_editor.cob:187-207].
         while (!eof && !failed) {
             try {
                 String record = input.readRecord();
                 if (record == null) {
-                    // io-status 10 [file_editor.cob:190].
                     eof = true;
                 } else {
                     String stored = rstripSpaces(record);
@@ -890,16 +831,26 @@ public final class FileEditor {
      * it renamed over the destination [file_editor.cob:465-510]. Each of the
      * four steps has its own diagnostic, so a failure names the step it
      * happened at. {@link #dirty} is cleared only after the rename has
-     * succeeded [file_editor.cob:504-505], and every failure path removes the
-     * temporary file [file_editor.cob:512-515], which is why no
-     * {@code *.tmp.*} sibling ever survives a run. The destination is never
-     * opened, truncated or written directly, so a failed save leaves both the
-     * document in memory and the file on disk exactly as they were.
+     * succeeded [file_editor.cob:504-505]. The destination is never opened,
+     * truncated or written directly, so a failed save leaves both the document
+     * in memory and the file on disk exactly as they were.
+     *
+     * <p>Every failure path attempts to remove the temporary file
+     * [file_editor.cob:512-515]. That removal is best effort, as the original's
+     * discarded {@code unlink} result was: a run leaves no {@code *.tmp.*}
+     * sibling behind whenever the removal succeeds, and a directory that
+     * refuses the removal keeps the file - which is reported no further,
+     * because the diagnostic for the failure that caused it has already been
+     * printed.
      *
      * <p>The C-string plumbing around the original's four {@code CALL STATIC}
      * sites [file_editor.cob:464-466,474-477,500-501] has no counterpart:
-     * {@link Path} values carry the two names, and the descriptor
-     * {@code mkstemp} returned is never held open here.
+     * {@link Path} values carry the two names. The descriptor the original
+     * opened with {@code mkstemp} and immediately closed
+     * [file_editor.cob:467-474] is instead held open until the save finishes,
+     * so every record is written through the handle that created the file and
+     * the temporary is never reopened by name; the reason that matters is with
+     * {@link LineSequentialFile#createTemp(Path)}.
      */
     private void saveDocument() {
         Path target = toPath(filePath);
@@ -912,28 +863,24 @@ public final class FileEditor {
                     "Cannot create a temporary file. Check the path and directory permissions.");
             return;
         }
-        Path temp;
+        LineSequentialFile.Output output;
         try {
-            temp = LineSequentialFile.createTemp(target);
+            output = LineSequentialFile.createTemp(target);
         } catch (IOException e) {
-            // Nothing was created, so there is nothing to clean up
-            // [file_editor.cob:469-473].
             console.println(
                     "Cannot create a temporary file. Check the path and directory permissions.");
             return;
         }
         boolean failed = false;
-        LineSequentialFile.Output output = null;
+        boolean writable = false;
         try {
-            output = LineSequentialFile.Output.open(temp);
+            output.open();
+            writable = true;
         } catch (IOException e) {
             console.println("Cannot open temporary file. File status: 30");
             failed = true;
         }
-        if (output != null) {
-            // `perform varying idx ... until idx > line-count or
-            // failed-flag = 1` [file_editor.cob:484-492]: the first refused
-            // record stops the loop.
+        if (writable) {
             for (int index = 0; index < lines.size() && !failed; index++) {
                 try {
                     output.writeRecord(lines.get(index));
@@ -945,8 +892,6 @@ public final class FileEditor {
                     failed = true;
                 }
             }
-            // Closed unconditionally and its status checked, as the original
-            // did [file_editor.cob:493-497].
             try {
                 output.close();
             } catch (IOException e) {
@@ -956,7 +901,7 @@ public final class FileEditor {
         }
         if (!failed) {
             try {
-                LineSequentialFile.replace(temp, target);
+                LineSequentialFile.replace(output.path(), target);
                 dirty = false;
                 console.println("Saved: " + filePath);
             } catch (IOException e) {
@@ -965,14 +910,25 @@ public final class FileEditor {
             }
         }
         if (failed) {
-            LineSequentialFile.deleteQuietly(temp);
+            LineSequentialFile.deleteQuietly(output.path());
         }
     }
 
     /**
-     * Removes leading and trailing spaces, reproducing
-     * {@code FUNCTION TRIM(x)} at its twenty call sites
-     * [file_editor.cob:102,146,160,161,165,172,219,225,303,310,347,353,394,395,465,500,506].
+     * Removes leading and trailing spaces: the semantics of
+     * {@code FUNCTION TRIM(x)}, which the original applied at twenty sites
+     * [file_editor.cob:102,146,160,161,165,172,219,225,230,237,238,303,310,347,353,394,395,465,500,506].
+     * Thirteen of them trim a value where it is used and are reproduced by
+     * calls to this method
+     * [file_editor.cob:102,146,160,161,165,172,237,238,303,310,353,394,395].
+     * The remaining seven need no call because the value is already trimmed
+     * before it gets there: {@link #filePath} is stored trimmed
+     * [file_editor.cob:219,225,465,500,506], the {@link #VOCABULARY} entries
+     * carry none of the {@code pic x(12)} padding the original trimmed off
+     * [file_editor.cob:347], and the line number printed by
+     * {@link #viewDocument()} comes from {@link Integer#toString(int)} rather
+     * than from the space-padded {@code display-number pic ZZZ9} edit field
+     * [file_editor.cob:230].
      *
      * <p>Only the byte 0x20 is removed, because that is all GnuCOBOL's
      * {@code TRIM} removes: a tab or a carriage return survives, which is what

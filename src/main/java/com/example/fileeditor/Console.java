@@ -10,57 +10,32 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * Terminal boundary for the Java port of {@code file_editor.cob}: the only
- * class of the program that touches standard input or standard output. It owns
- * the two facts a JVM would otherwise get wrong when it stands in for the
- * GnuCOBOL runtime - the charset and the line-reading rule - so that neither
- * has to be restated at the eleven {@code WITH NO ADVANCING} prompt sites
- * [file_editor.cob:100,143,158,169,251,277,289,300,334,360,391] or at the
- * remaining newline-terminated {@code DISPLAY} statements.
+ * class of the program that touches standard input or standard output, and the
+ * single place that states the charset and the line-reading rule the GnuCOBOL
+ * runtime used to supply.
  *
- * <p>Reproduces:</p>
- * <ul>
- *   <li>paragraph {@code read-answer} [file_editor.cob:131-138] -
- *       {@code move spaces to answer / accept answer / on exception ... stop
- *       run} - as {@link #readLine()};</li>
- *   <li>the {@code answer pic x(4096)} response field [file_editor.cob:39] -
- *       as the {@link #ANSWER_CAPACITY} truncation applied by
- *       {@link #readLine()};</li>
- *   <li>the {@code DISPLAY} and {@code DISPLAY ... WITH NO ADVANCING}
- *       conventions - as {@link #println(String)} and {@link #print(String)}.</li>
- * </ul>
+ * <p><b>Charset.</b> Every byte read and written is mapped through ISO-8859-1,
+ * so one {@code char} is one byte and {@code String.length()} is a byte count
+ * exactly as the original {@code PIC X} fields counted bytes. Output goes
+ * through {@link FileDescriptor#out} rather than {@link System#out}, whose
+ * encoder uses the platform stdout charset (UTF-8 on the reference JDK) and
+ * would re-encode bytes 0x80-0xFF and break the byte-exact transcript.</p>
  *
- * <p><b>Charset.</b> Every byte read and every byte written is mapped through
- * ISO-8859-1, so one {@code char} is one byte and {@code String.length()} is a
- * byte count exactly as the original {@code PIC X} fields counted bytes. Output
- * goes through {@link FileDescriptor#out} rather than {@link System#out}
- * because {@code System.out}'s encoder uses the platform stdout charset (UTF-8
- * on the reference JDK), which would re-encode bytes 0x80-0xFF and break the
- * byte-exact transcript.</p>
- *
- * <p><b>Line-reading rule.</b> A response ends at a line feed, which is
- * consumed and never part of the answer; a carriage return is ordinary data and
- * is never treated as a terminator or stripped (GnuCOBOL's {@code FUNCTION
- * TRIM} removes spaces only, so the menu answer {@code 1} followed by a
- * carriage return is an invalid choice, and the port must agree). End of input
- * before a terminator - including end of input with no bytes read at all -
- * raises {@link InputEndedException}, which discards any partial line, exactly
- * as the {@code ON EXCEPTION} arm of {@code accept answer} did. At most
- * {@link #ACCEPT_BUFFER} bytes are consumed per call and at most
- * {@link #ANSWER_CAPACITY} bytes are returned.</p>
+ * <p><b>Line-reading rule.</b> A line feed terminates a response and is
+ * consumed; a carriage return is ordinary data, never a terminator and never
+ * stripped, because GnuCOBOL's {@code FUNCTION TRIM} removes spaces only. End
+ * of input before a terminator raises {@link InputEndedException} and discards
+ * any partial line.</p>
  *
  * <p><b>Silence and flushing.</b> Nothing here writes to {@code System.err} and
- * nothing here terminates the process: the only throw is
- * {@link InputEndedException}, and write failures are swallowed by
- * {@link PrintStream} by design, so a closed standard output can neither raise
- * an exception nor produce a diagnostic. Every write is flushed immediately -
- * approved exception D5 of the conversion plan: the byte content is identical
- * to the original's C-stdio output and only the timing differs, and flushing is
- * required so that an operator sees {@code Choice: } and each prompt before the
+ * nothing here terminates the process; write failures are swallowed by
+ * {@link PrintStream}, so a closed standard output can neither raise an
+ * exception nor produce a diagnostic. Every write is flushed immediately, which
+ * is what lets an operator see {@code Choice: } and each prompt before the
  * program blocks on input.</p>
  *
- * <p>The class is not thread-safe and does not need to be: the program is
- * single-threaded and constructs exactly one instance, held by
- * {@code FileEditor}.</p>
+ * <p>The class is not thread-safe: the program is single-threaded, exactly one
+ * instance exists, and {@link #readLine()} reuses one buffer.</p>
  */
 final class Console {
 
@@ -94,7 +69,6 @@ final class Console {
      */
     private static final int ANSWER_CAPACITY = 4096;
 
-    /** Value {@link InputStream#read()} returns at end of input. */
     private static final int END_OF_STREAM = -1;
 
     /** Response terminator; consumed by {@link #readLine()}, never returned. */
@@ -106,7 +80,6 @@ final class Console {
      */
     private static final char NEWLINE = '\n';
 
-    /** Operator input, buffered so the byte-at-a-time loop stays cheap. */
     private final InputStream in;
 
     /**
@@ -125,11 +98,6 @@ final class Console {
      */
     private final byte[] answer = new byte[ACCEPT_BUFFER];
 
-    /**
-     * Binds the console to the process's standard input and standard output.
-     * Constructed exactly once, by {@code FileEditor}; nothing here can fail,
-     * because wrapping an already-open file descriptor performs no I/O.
-     */
     Console() {
         this.in = new BufferedInputStream(System.in);
         this.out = new PrintStream(
@@ -166,29 +134,17 @@ final class Console {
             try {
                 b = in.read();
             } catch (IOException e) {
-                // The stream is unusable, which is the condition libcob's
-                // ACCEPT reported through ON EXCEPTION. No diagnostic is
-                // produced here and nothing reaches standard error: the
-                // catching method in FileEditor owns the two lifecycle lines
-                // [file_editor.cob:135-136].
                 throw new InputEndedException();
             }
             if (b == END_OF_STREAM) {
-                // End of input before a terminator. The throw is unconditional,
-                // so a partial line is discarded rather than returned - the
-                // oracle's behavior, and the case the acceptance suite drives
-                // when its final command has been consumed.
                 throw new InputEndedException();
             }
             if (b == LINE_FEED) {
-                // The terminator is consumed and is never part of the answer.
                 break;
             }
             answer[length++] = (byte) b;
         }
         String response = new String(answer, 0, length, StandardCharsets.ISO_8859_1);
-        // The field is narrower than the runtime's ACCEPT buffer, so what was
-        // consumed and what is delivered differ for a long response.
         return response.length() > ANSWER_CAPACITY
                 ? response.substring(0, ANSWER_CAPACITY)
                 : response;
