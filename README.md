@@ -106,7 +106,10 @@ a selected word, and `S` to save. Choose `Q` to exit.
 - New files are created on disk at save time. The parent directory must exist.
 - Save writes a temporary file in the same directory and renames it over the
   destination after successful writing and closing. If saving fails, the
-  document stays in memory and the previous destination is preserved.
+  document stays in memory and the previous destination is preserved: one
+  message names the step that failed, and the temporary file is removed. A
+  destination that is a directory, the filesystem root included, is refused at
+  that rename, because a directory cannot be replaced by a file.
 - Saved files have private permissions (`0600`) from exclusive temporary-file
   creation. Saving replaces the directory entry; file metadata is not
   preserved, and a symbolic link path is replaced rather than updating its
@@ -130,10 +133,16 @@ a selected word, and `S` to save. Choose `Q` to exit.
   cannot be saved and reports `File status: 71`. A line longer than 1,025
   bytes, or a file ending in a bare carriage return, is refused with
   `File status: 06`. These match the GnuCOBOL 3.2 line-sequential rules the
-  original ran under. The path you type is used literally: there is no
-  environment-variable substitution, and the path must be representable in the
-  terminal's locale charset, where UTF-8 is expected. Binary files and exact
-  whitespace preservation are outside the editor's scope.
+  original ran under. Failures the operating system reports are shown the same
+  way: `File status: 37` when access is denied, and `File status: 30` for any
+  other input/output error. That catch-all is the one place this differs from
+  the original, which sometimes named a narrower condition there, reporting
+  `34` for a full filesystem, for instance. A file that does not exist is not
+  such a failure: the editor offers to create it. The path you type is used
+  literally: there is no environment-variable substitution, and the path must
+  be representable in the terminal's locale charset, where UTF-8 is expected.
+  Binary files and exact whitespace preservation are outside the editor's
+  scope.
 - End of terminal input exits without saving pending changes. Use `S` or the
   save prompt before ending a session.
 

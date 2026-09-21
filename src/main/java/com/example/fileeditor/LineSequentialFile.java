@@ -220,11 +220,25 @@ final class LineSequentialFile {
          * Opens a file for reading, mapping the failure to the {@code io-status}
          * value the COBOL {@code evaluate} tested [file_editor.cob:166-184].
          *
-         * <p>A directory opens as an <em>empty document</em>, which is the
-         * oracle's behavior (it prints {@code Opened: adir} and lists nothing).
-         * The pre-check is also functionally necessary: on Linux
-         * {@code Files.newInputStream} succeeds for a directory and only fails
-         * on the first read.</p>
+         * <p>The open is <em>always attempted</em>, because the operating
+         * system's permission check is what produces status {@code 37}: the
+         * oracle's {@code OPEN INPUT} reaches the file system for every path it
+         * is given, so a path the operator may not read is refused whether it
+         * names a file or a directory. Classifying a path as a directory
+         * <em>instead of</em> opening it would answer {@code Opened: <dir>} for
+         * a directory whose contents cannot be reached at all.</p>
+         *
+         * <p>A directory that does open is presented as an <em>empty
+         * document</em>, which is the oracle's behavior (it prints
+         * {@code Opened: adir} and lists nothing). That substitution is
+         * therefore made after the open, on both of the paths an accessible
+         * directory can take: Linux accepts {@code open(2)} on a readable
+         * directory and fails only on the first read, while a platform that
+         * refuses such an open outright surfaces the refusal as a plain
+         * {@link IOException} - which is a directory presented as empty here
+         * and status {@code 30} for anything else. The handle an accepted open
+         * produced is released before the empty document replaces it, so no
+         * descriptor outlives the call.</p>
          *
          * <p>{@code NoSuchFileException} covers both a missing file and a
          * missing parent directory, and both must map to status {@code 35} so
@@ -232,25 +246,51 @@ final class LineSequentialFile {
          * [file_editor.cob:168-183].</p>
          *
          * @param p path to open
-         * @return an open reader positioned before the first record
+         * @return an open reader positioned before the first record, or a reader
+         *         over no records at all when {@code p} is a directory
          * @throws FileStatusException status {@code 35} when the file or its
          *                             parent directory does not exist,
-         *                             {@code 37} when access is denied, and
+         *                             {@code 37} when access is denied - to a
+         *                             directory as much as to a file - and
          *                             {@code 30} for any other I/O failure
          */
         static Input open(Path p) throws FileStatusException {
-            if (Files.isDirectory(p)) {
-                return new Input(new ByteArrayInputStream(new byte[0]));
-            }
+            InputStream opened;
             try {
-                return new Input(new BufferedInputStream(Files.newInputStream(p)));
+                opened = Files.newInputStream(p);
             } catch (NoSuchFileException e) {
                 throw new FileStatusException(STATUS_FILE_NOT_FOUND);
             } catch (AccessDeniedException e) {
                 throw new FileStatusException(STATUS_PERMISSION_DENIED);
             } catch (IOException e) {
+                if (Files.isDirectory(p)) {
+                    return emptyDocument();
+                }
                 throw new FileStatusException(STATUS_PERMANENT_ERROR);
             }
+            if (Files.isDirectory(p)) {
+                try {
+                    opened.close();
+                } catch (IOException | RuntimeException ignored) {
+                    // The open existed so that the permission check ran; the
+                    // document is empty either way, and a failure to release
+                    // the handle is not a diagnostic of its own.
+                }
+                return emptyDocument();
+            }
+            return new Input(new BufferedInputStream(opened));
+        }
+
+        /**
+         * A directory as the oracle presents one: a document of no records, so
+         * the caller's read loop ends immediately, the empty document is
+         * committed and {@code Opened: <path>} is printed
+         * [file_editor.cob:187-219].
+         *
+         * @return a reader that is already at end of file
+         */
+        private static Input emptyDocument() {
+            return new Input(new ByteArrayInputStream(new byte[0]));
         }
 
         /**
@@ -414,6 +454,15 @@ final class LineSequentialFile {
         /** Buffered record writer over {@link #channel}; closing it closes the channel. */
         private final OutputStream out;
 
+        /**
+         * Set when a record write failed at the file itself rather than at
+         * validation, so that the bytes the buffer could not place are known to
+         * be unplaceable. {@link #close()} is the only reader: it decides on
+         * this whether flushing them again is a second attempt at a failure
+         * already reported.
+         */
+        private boolean writeFailed;
+
         private Output(Path path, FileChannel channel) {
             this.path = path;
             this.channel = channel;
@@ -478,6 +527,14 @@ final class LineSequentialFile {
          * document with no lines therefore produces a zero-byte file, and a
          * blank or all-space line produces a bare {@code LF}.</p>
          *
+         * <p>A write that fails at the file rather than at validation - a full
+         * filesystem is the reachable case - is remembered, because the record
+         * bytes are then still in the buffer and {@link #close()} must not
+         * offer them to the file a second time. A refused record
+         * ({@code 71}) is not such a failure: nothing was written, the buffer
+         * holds only records that were placed, and the close flushes them
+         * normally.</p>
+         *
          * @param line the document line to write, one char per byte
          * @throws FileStatusException status {@code 71} when the line contains
          *                             any control byte; nothing has been written
@@ -490,8 +547,13 @@ final class LineSequentialFile {
                     throw new FileStatusException(STATUS_INVALID_WRITE_DATA);
                 }
             }
-            out.write(rstripSpaces(line).getBytes(StandardCharsets.ISO_8859_1));
-            out.write(LINE_FEED);
+            try {
+                out.write(rstripSpaces(line).getBytes(StandardCharsets.ISO_8859_1));
+                out.write(LINE_FEED);
+            } catch (IOException e) {
+                writeFailed = true;
+                throw e;
+            }
         }
 
         /**
@@ -499,20 +561,35 @@ final class LineSequentialFile {
          * caller maps a failure to
          * {@code Cannot close saved file. File status: 30}.
          *
-         * <p>Closing the buffered stream is the whole operation: it flushes the
-         * bytes still held in the buffer, so a failure to reach the disk
-         * surfaces here as an {@link IOException} rather than being lost, and
-         * it closes the retained handle <em>even when that flush fails</em>.
-         * Flushing in a separate statement beforehand would skip the close on
-         * exactly that failure and leak the handle of every save that
-         * failed.</p>
+         * <p>Where every record reached the file, closing the buffered stream
+         * is the whole operation: it flushes the bytes still held in the
+         * buffer, so a failure to reach the disk surfaces here as an
+         * {@link IOException} rather than being lost, and it closes the
+         * retained handle <em>even when that flush fails</em>. Flushing in a
+         * separate statement beforehand would skip the close on exactly that
+         * failure and leak the handle of every save that failed.</p>
          *
-         * @throws IOException the flush performed by the close, or the close
-         *                     itself, failed; the handle has been released
-         *                     either way
+         * <p>Where a record write has already failed at the file
+         * ({@link #writeRecord(String)} recorded it), the buffer still holds
+         * the bytes that could not be placed, and flushing them again would
+         * raise that one failure a second time - which the caller would report
+         * as a second diagnostic for a single full filesystem. The oracle
+         * reports such a save once, at the write, and its {@code CLOSE}
+         * succeeds [file_editor.cob:493-497], so this releases the handle
+         * directly and drops the buffer. Nothing is lost by dropping it: the
+         * caller removes the temporary file on every failure path, so those
+         * bytes have no destination left.</p>
+         *
+         * @throws IOException the flush performed by the close, or the release
+         *                     of the handle, failed; the handle has been
+         *                     released either way
          */
         @Override
         public void close() throws IOException {
+            if (writeFailed) {
+                channel.close();
+                return;
+            }
             out.close();
         }
     }
@@ -524,11 +601,13 @@ final class LineSequentialFile {
      * {@code <path>.tmp.XXXXXX} together with the {@code close} of the
      * descriptor it returned [file_editor.cob:464-477].
      *
-     * <p>The file is always a sibling of the destination in the destination's
-     * own directory, named {@code <name>.tmp.<digits>} after 64 random bits,
-     * so the rename that completes the save is never across filesystems and
-     * the name has the {@code *.tmp.*} shape the acceptance suite looks for.
-     * The mode is {@code 0600}, as {@code mkstemp} gave it.</p>
+     * <p>The file is always created in the destination's own directory - a
+     * sibling of the destination, except where the destination is itself a
+     * directory root, which the last paragraph covers - named
+     * {@code <name>.tmp.<digits>} after 64 random bits, so the rename that
+     * completes the save is never across filesystems and the name has the
+     * {@code *.tmp.*} shape the acceptance suite looks for. The mode is
+     * {@code 0600}, as {@code mkstemp} gave it.</p>
      *
      * <p>Creating the file and opening it are one operation, and the handle it
      * yields is the one every record is written through. The original instead
@@ -544,15 +623,26 @@ final class LineSequentialFile {
      *
      * <p>A missing destination directory fails here exactly as {@code mkstemp}
      * did, with a {@code NoSuchFileException}: no directory is created and no
-     * fallback location is used. The guard on a {@code null} parent or file
-     * name covers the filesystem root, which {@link Input#open(Path)} accepts
-     * as a directory and therefore opens as an empty document; the oracle's
-     * {@code mkstemp("/.tmp.XXXXXX")} fails for an unprivileged operator, and
-     * failing here produces the same diagnostic instead of letting an
-     * exception escape.</p>
+     * fallback location is used.</p>
+     *
+     * <p>A destination with no parent and no name of its own - the filesystem
+     * root, which {@link Input#open(Path)} accepts as a directory and therefore
+     * opens as an empty document - takes its temporary <em>inside</em> itself,
+     * as {@code /.tmp.<digits>}. That is what the original produced: it built
+     * the template by appending to the path string rather than by splitting it
+     * [file_editor.cob:465], so {@code /} gave {@code mkstemp("/.tmp.XXXXXX")}.
+     * The consequence is the oracle's on both sides of the permission
+     * boundary - an operator who may write there reaches the rename, which
+     * fails because the destination is a directory
+     * ({@code Cannot replace destination. Changes remain unsaved.}), and one
+     * who may not is refused here
+     * ({@code Cannot create a temporary file. Check the path and directory
+     * permissions.}). Both leave the document unsaved and nothing on disk.
+     * Deriving the directory this way is also what keeps a {@code null} from
+     * reaching the create, so no exception escapes for that path.</p>
      *
      * @param target the destination file the save will replace
-     * @return a writer owning the newly created private temporary sibling of
+     * @return a writer owning the newly created private temporary file for
      *         {@code target}; the caller closes it and reads
      *         {@link Output#path()} for the rename and the cleanup
      * @throws IOException no temporary file could be created; the caller
@@ -564,14 +654,15 @@ final class LineSequentialFile {
         Path abs = target.toAbsolutePath();
         Path parent = abs.getParent();
         Path name = abs.getFileName();
-        if (parent == null || name == null) {
-            throw new IOException(
-                    "no sibling temporary file can be created for " + abs);
-        }
-        String prefix = name.toString() + TEMP_INFIX;
+        // The original's template was the destination path with ".tmp.XXXXXX"
+        // appended, which puts the temporary in the destination's directory
+        // under the destination's name - and, where the destination is a
+        // directory root with neither a parent nor a name, inside that root.
+        Path directory = parent == null ? abs : parent;
+        String prefix = (name == null ? "" : name.toString()) + TEMP_INFIX;
         FileAlreadyExistsException taken = null;
         for (int attempt = 0; attempt < TEMP_NAME_ATTEMPTS; attempt++) {
-            Path temp = parent.resolve(
+            Path temp = directory.resolve(
                     prefix + Long.toUnsignedString(TEMP_NAMES.nextLong()));
             try {
                 return new Output(temp,
@@ -581,7 +672,7 @@ final class LineSequentialFile {
             }
         }
         throw new IOException(TEMP_NAME_ATTEMPTS
-                + " temporary file names were already taken in " + parent, taken);
+                + " temporary file names were already taken in " + directory, taken);
     }
 
     /**

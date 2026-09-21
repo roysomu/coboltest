@@ -830,10 +830,17 @@ public final class FileEditor {
      * is created, every line is written to it, it is closed, and only then is
      * it renamed over the destination [file_editor.cob:465-510]. Each of the
      * four steps has its own diagnostic, so a failure names the step it
-     * happened at. {@link #dirty} is cleared only after the rename has
-     * succeeded [file_editor.cob:504-505]. The destination is never opened,
-     * truncated or written directly, so a failed save leaves both the document
-     * in memory and the file on disk exactly as they were.
+     * happened at - and one failure produces one diagnostic: the close that
+     * follows a write which failed at the file reports nothing of its own,
+     * because it would be reporting that same failure again
+     * ({@link LineSequentialFile.Output#close()} carries that). A destination
+     * that is a directory, the filesystem root included, gets as far as the
+     * rename and fails there, exactly as the original did
+     * ({@link LineSequentialFile#createTemp(Path)} carries that).
+     * {@link #dirty} is cleared only after the rename has succeeded
+     * [file_editor.cob:504-505]. The destination is never opened, truncated or
+     * written directly, so a failed save leaves both the document in memory and
+     * the file on disk exactly as they were.
      *
      * <p>Every failure path attempts to remove the temporary file
      * [file_editor.cob:512-515]. That removal is best effort, as the original's
