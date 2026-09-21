@@ -1,4 +1,4 @@
-"""End-to-end checks against the compiled COBOL program; no dependencies."""
+"""End-to-end checks against the packaged Java program; no dependencies."""
 
 from pathlib import Path
 import subprocess
@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 
-PROGRAM = Path(__file__).resolve().parents[1] / "file_editor"
+JAR = Path(__file__).resolve().parents[1] / "target" / "file-editor.jar"
 
 
 class EditorTests(unittest.TestCase):
@@ -18,7 +18,7 @@ class EditorTests(unittest.TestCase):
 
     def run_editor(self, *commands):
         result = subprocess.run(
-            [str(PROGRAM)], input="\n".join(map(str, commands)) + "\n",
+            ["java", "-jar", str(JAR)], input="\n".join(map(str, commands)) + "\n",
             text=True, capture_output=True, cwd=self.root, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
