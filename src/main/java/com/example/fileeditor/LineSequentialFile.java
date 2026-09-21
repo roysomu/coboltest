@@ -17,9 +17,14 @@ import java.nio.file.StandardOpenOption;
 
 /**
  * Line-sequential file primitives for the Java port of {@code file_editor.cob}.
- * This is the only class of the program that touches {@code java.nio.file}, so
- * every GnuCOBOL line-sequential rule and every POSIX save primitive is
- * implemented exactly once, here.
+ * This is the only class of the program that performs file-content I/O and
+ * filesystem mutation - open, read, write, close, temporary-file creation,
+ * atomic replace and delete - so every GnuCOBOL line-sequential rule and every
+ * POSIX save primitive is implemented exactly once, here. The one other
+ * {@code java.nio.file} use in the program is {@link FileEditor}'s path
+ * conversion: it decodes the operator's path bytes into a
+ * {@link java.nio.file.Path} and passes that in, without opening, reading,
+ * writing or removing anything itself.
  *
  * <p>Reproduces:</p>
  * <ul>
@@ -73,7 +78,10 @@ final class LineSequentialFile {
      * so that an over-long line is detectable: {@code 01 file-line pic x(1025)}
      * [file_editor.cob:15]. A record of exactly this many bytes is returned to
      * the caller, whose own width check rejects it; only a longer record is
-     * refused here with status {@code 06}.
+     * refused here with status {@code 06}. A {@code CR} that turns out to
+     * belong to a {@code CRLF} delimiter never occupies one of these bytes;
+     * {@link Input#readRecord()} documents that accounting and why it differs
+     * from the plan's pseudocode.
      */
     static final int RECORD_SIZE = 1025;
 
@@ -228,13 +236,40 @@ final class LineSequentialFile {
          * delimiter and is discarded without ever counting toward the record
          * length; if the next byte is anything else the pending {@code CR} is
          * flushed into the record as data, where the control-byte scan below
-         * refuses it with status {@code 09}. Holding it matters at the
-         * boundary: the oracle accepts a CRLF-terminated line of exactly
-         * {@link #RECORD_SIZE} data bytes (the caller then reports
-         * {@code File exceeds 1000 lines or 1024 characters per line.}) and
-         * only reports {@code 06} from {@link #RECORD_SIZE} + 1 data bytes
-         * upward. Counting the {@code CR} first would report {@code 06} one
-         * byte too early.</p>
+         * refuses it with status {@code 09}. The flush happens exactly once,
+         * before the byte that ended the hold is classified, so a run of
+         * {@code CR} bytes stores all but its last one and that last one faces
+         * the same {@code LF} test as any other held {@code CR}.</p>
+         *
+         * <p>Holding the {@code CR} outside the record area is deliberately
+         * <em>not</em> the formulation AAP sections 0.5.2 and 0.7.5 write out,
+         * which retains the {@code CR} in the {@link #RECORD_SIZE} buffer like
+         * any other byte and strips it again when {@code LF} arrives. That
+         * formulation is not reproduced because it reports status {@code 06}
+         * one byte early: after a line of {@link #RECORD_SIZE} data bytes the
+         * {@code CR} is the byte that overflows the buffer and sets the
+         * over-limit flag, and because its removal at {@code LF} is itself
+         * conditional on that flag being clear, the flag survives to the
+         * finish sequence and becomes {@code 06}. AAP section 0.1.1 makes the
+         * GnuCOBOL 3.2.0 oracle authoritative over the plan's pseudocode, and
+         * the oracle was measured as:</p>
+         * <ul>
+         *   <li>{@link #RECORD_SIZE} data bytes then {@code CRLF} - the record
+         *       is returned and the caller reports {@code File exceeds 1000
+         *       lines or 1024 characters per line.}, not {@code 06};</li>
+         *   <li>1,024 {@code x} then one space then {@code CRLF}, also
+         *       {@link #RECORD_SIZE} data bytes - the file opens, the stored
+         *       line being 1,024 bytes once trailing spaces are removed;</li>
+         *   <li>{@code 06} appears only from {@link #RECORD_SIZE} + 1 data
+         *       bytes upward, with or without a trailing {@code CR};</li>
+         *   <li>a file whose final byte is a bare {@code CR} yields {@code 06},
+         *       while a {@code CR} anywhere else inside a record yields
+         *       {@code 09}.</li>
+         * </ul>
+         *
+         * <p>Those four outcomes are what this method produces, and they are
+         * what AAP section 0.5.2's own prose describes; only its pseudocode
+         * disagrees.</p>
          *
          * @return the record without its delimiter, the empty string for a blank
          *         line, or {@code null} at end of file with nothing consumed -
@@ -265,20 +300,15 @@ final class LineSequentialFile {
                     break;
                 }
                 if (b == LINE_FEED) {
+                    // A held CR belongs to the delimiter: neither stored nor
+                    // counted. Tested before the flush below so it stays that
+                    // way.
                     break;
                 }
-                if (b == CARRIAGE_RETURN) {
-                    if (pendingCr) {
-                        any = true;
-                        if (retained < RECORD_SIZE) {
-                            buf[retained++] = (byte) CARRIAGE_RETURN;
-                        } else {
-                            overLimit = true;
-                        }
-                    }
-                    pendingCr = true;
-                    continue;
-                }
+                // The hold ended with a byte that is not LF, so the held CR is
+                // data. Flushed exactly once here, before b itself is
+                // classified, which covers a CR run too: every CR but the last
+                // is stored and the last one is held in turn.
                 if (pendingCr) {
                     pendingCr = false;
                     any = true;
@@ -287,6 +317,10 @@ final class LineSequentialFile {
                     } else {
                         overLimit = true;
                     }
+                }
+                if (b == CARRIAGE_RETURN) {
+                    pendingCr = true;
+                    continue;
                 }
                 any = true;
                 if (retained < RECORD_SIZE) {
@@ -400,15 +434,22 @@ final class LineSequentialFile {
         /**
          * {@code CLOSE text-file} after a save [file_editor.cob:493-497]; the
          * caller maps a failure to
-         * {@code Cannot close saved file. File status: 30}. Buffered bytes are
-         * flushed first so a failure to reach the disk surfaces here rather
-         * than being lost.
+         * {@code Cannot close saved file. File status: 30}.
          *
-         * @throws IOException the flush or close failed
+         * <p>Closing the buffered stream is the whole operation: it flushes the
+         * bytes still held in the buffer, so a failure to reach the disk
+         * surfaces here as an {@link IOException} rather than being lost, and
+         * it releases the underlying descriptor <em>even when that flush
+         * fails</em>. Flushing in a separate statement beforehand would skip
+         * the close on exactly that failure and leak the descriptor of every
+         * save that failed.</p>
+         *
+         * @throws IOException the flush performed by the close, or the close
+         *                     itself, failed; the descriptor has been released
+         *                     either way
          */
         @Override
         public void close() throws IOException {
-            out.flush();
             out.close();
         }
     }

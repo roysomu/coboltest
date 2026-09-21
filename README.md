@@ -8,30 +8,42 @@ words or lines, delete words or lines, and save your changes.
 
 ## Build and run
 
-Requires **JDK 17** (tested with OpenJDK 17.0.20), **Apache Maven 3.9.16**, and
-macOS or Linux. JDK 21 and 25 also build the project because the compiler
-targets release 17, and Maven 3.8.x works as well. Python 3.7 or later is
-needed only for the automated tests.
+Requires **JDK 17** (tested with OpenJDK 17.0.20), **Apache Maven 3.8.x or
+later** (tested with Maven 3.9.16), and macOS or Linux. JDK 21 and 25 also
+build the project because the compiler targets release 17. Python 3.7 or later
+is needed only for the automated tests.
 
-Install the toolchain on macOS:
+Install the toolchain on macOS. Homebrew's Maven depends on an unversioned
+`openjdk` formula, so `JAVA_HOME` has to point at JDK 17; otherwise Maven runs
+on whichever JDK Homebrew installed alongside it:
 
 ```sh
 brew install --cask temurin@17 && brew install maven
+export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 ```
 
-On Debian/Ubuntu:
+Put that export in your shell profile to make it permanent.
+
+On Debian/Ubuntu, installing packages needs root, so run these in a root shell
+or with `sudo` as shown:
 
 ```sh
-apt-get install openjdk-17-jdk-headless maven
+sudo apt-get update
+sudo apt-get install openjdk-17-jdk-headless maven
 ```
 
-Check the versions first; expect `17.0.x` from the JDK and `3.9.x` (or
-`3.8.x`) from Maven:
+Check the versions first; expect `17.0.x` from the JDK and `3.8.x` or later
+from Maven:
 
 ```sh
 java -version
 mvn -version
 ```
+
+`mvn -version` also prints a `Java version:` line for the JDK Maven itself
+runs on, which need not be the first `java` on your path. It has to name the
+JDK you mean to build with: `17.0.x` for the tested toolchain. If it names
+another JDK, export `JAVA_HOME` as shown above and check again.
 
 From this directory:
 
@@ -93,7 +105,11 @@ a selected word, and `S` to save. Choose `Q` to exit.
   detected.
 - Supports up to **1,000 lines**, **1,024 bytes per line**, and **512 bytes in a
   path**. Oversized documents are rejected; a failed open keeps the current
-  document. Interactive responses are buffered up to 4,096 bytes.
+  document. Each interactive response reads at most **8,191 bytes** of input
+  and keeps at most the first **4,096 bytes** of them, so a 4,097-byte answer
+  is one response truncated to 4,096 bytes. A line longer than 8,191 bytes
+  arrives as several successive responses: the bytes past that limit, the line
+  feed included, stay in the input and become the next response.
 - Intended for ordinary plain text, especially ASCII. Operations count bytes
   rather than Unicode characters: text is handled as ISO-8859-1, so one
   character is one byte. Line feeds separate lines, and a carriage return

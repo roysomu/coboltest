@@ -30,15 +30,55 @@ import java.util.Random;
  * original compiled with GnuCOBOL 3.2.0 under its default runtime and driven
  * through standard input and output: the transcript, every operator-visible
  * string, every limit, the exit status, the bytes written to disk and the
- * side effects on the filesystem. Deliberate, approved differences are limited
- * to the random word sequence (a fresh {@link Random} replaces
- * {@code FUNCTION RANDOM} seeded from {@code ACCEPT ... FROM TIME}
- * [file_editor.cob:89-90,345-346]), the shape of the temporary file's suffix,
- * flushing after every write, the I/O status set reachable without fault
- * injection, and paths whose bytes the filesystem charset cannot represent
- * (see {@link #toPath(String)}). The banner
- * {@code COBOL Text File Editor} [file_editor.cob:91] is part of the transcript
- * and is therefore kept verbatim.
+ * side effects on the filesystem. The authority on what may differ is the
+ * divergence register of the conversion plan (section 0.5.4), whose approved
+ * exceptions D1 to D8 are listed in full below; a difference that is not one
+ * of them is a defect rather than a design choice.</p>
+ * <ul>
+ *   <li><b>D1 - filename mapping.</b> The path the operator types is used
+ *       literally, always. The original's COBOL runtime mapped a bare name
+ *       that matched an environment variable to that variable's value and
+ *       prefixed relative names with {@code COB_FILE_PATH}; that is runtime
+ *       configuration rather than program logic, and it is deliberately not
+ *       reproduced - nothing in this program reads an environment
+ *       variable.</li>
+ *   <li><b>D2 - temporary file suffix.</b> The six random alphanumerics
+ *       {@code mkstemp} substitutes for the {@code XXXXXX} of
+ *       {@code <path>.tmp.XXXXXX} [file_editor.cob:465-468] become the
+ *       decimal digits {@code Files.createTempFile} appends. Both are
+ *       exclusive, private (0600) {@code <name>.tmp.*} siblings in the
+ *       destination directory, so a residue check over that glob sees the
+ *       same thing.</li>
+ *   <li><b>D3 - random word sequence.</b> A fresh {@link Random} replaces
+ *       {@code FUNCTION RANDOM} seeded from {@code ACCEPT ... FROM TIME}
+ *       [file_editor.cob:89-90,345-346]. The sequence differs run to run in
+ *       both implementations; the uniform choice over the twenty
+ *       {@link #VOCABULARY} entries is preserved.</li>
+ *   <li><b>D4 - storage layout.</b> One heap list bounded at
+ *       {@link #MAX_LINES} entries replaces the two preallocated
+ *       1,000 x 1,024-byte tables [file_editor.cob:20-23]. The capacity and
+ *       width bounds are enforced by the same explicit checks at the same
+ *       values, so only the memory footprint differs.</li>
+ *   <li><b>D5 - flushing.</b> Every write is flushed immediately instead of
+ *       being buffered by the C runtime when standard output is a pipe. The
+ *       bytes are identical and only the timing differs, which is what makes
+ *       a prompt appear before the program blocks on input.</li>
+ *   <li><b>D6 - I/O status set.</b> For operating-system failures only the
+ *       statuses reachable without fault injection are produced - {@code 35}
+ *       not found, {@code 37} permission denied and {@code 30} for any other
+ *       failure - whereas the data-validation statuses {@code 06},
+ *       {@code 09} and {@code 71} are reproduced exactly.</li>
+ *   <li><b>D7 - unrepresentable paths.</b> A path whose bytes the filesystem
+ *       charset cannot represent, and a path containing a NUL byte, are
+ *       refused with {@code Invalid file path.} instead of being handed to
+ *       the C library; see {@link #toPath(String)}.</li>
+ *   <li><b>D8 - exit status.</b> The status is {@code 0} on every path, which
+ *       is the oracle's behavior and the process contract stated below; a
+ *       non-3.x COBOL toolchain leaked a non-zero status from the
+ *       failed-temporary-file path.</li>
+ * </ul>
+ * <p>The banner {@code COBOL Text File Editor} [file_editor.cob:91] is part
+ * of the transcript and is therefore kept verbatim.
  *
  * <p><b>Byte semantics.</b> Every byte of input, output and file content is
  * mapped through ISO-8859-1 by {@link Console} and {@link LineSequentialFile},
@@ -291,8 +331,6 @@ public final class FileEditor {
                                 // document rewrites it byte for byte
                                 // [file_editor.cob:122].
                                 saveDocument();
-                                break;
-                            default:
                                 break;
                         }
                     }
