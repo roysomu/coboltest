@@ -121,7 +121,7 @@ final class LineSequentialFile {
 
     /**
      * Fixed part of the temporary file name. The COBOL template was
-     * {@code <path>.tmp.XXXXXX} [file_editor.cob:466]; the six random
+     * {@code <path>.tmp.XXXXXX} [file_editor.cob:465]; the six random
      * characters {@code mkstemp} substituted become the decimal digits of a
      * random {@code long}, so the name still has the {@code *.tmp.*} shape a
      * residue check looks for.
