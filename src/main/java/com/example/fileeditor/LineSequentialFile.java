@@ -207,8 +207,10 @@ final class LineSequentialFile {
         /**
          * Record area, allocated once per open file exactly as the COBOL FD
          * allocated {@code file-line} once [file_editor.cob:15]. The reader is
-         * bounded by this buffer, so an arbitrarily long physical line costs
-         * constant memory.
+         * bounded by this buffer and stops at it: a record that would outgrow
+         * it is refused at the byte that does not fit, so no line, however
+         * long, costs more than these bytes of memory or more reading than the
+         * limit itself.
          */
         private final byte[] buf = new byte[RECORD_SIZE];
 
@@ -298,12 +300,18 @@ final class LineSequentialFile {
          * [file_editor.cob:188] together with the GnuCOBOL 3.2 line-sequential
          * rules the COBOL source does not spell out.
          *
-         * <p>The reader is bounded: at most {@link #RECORD_SIZE} bytes are
-         * retained, and bytes beyond that are consumed and discarded while only
-         * setting a saturating over-limit flag. The whole physical line is
-         * always consumed, so the next call starts at the next record and an
-         * arbitrarily long line costs constant memory. A final record that end
-         * of file cuts short, with no {@code LF} of its own, is still a
+         * <p>The reader is bounded, and it stops at the bound: at most
+         * {@link #RECORD_SIZE} bytes are retained, and the first byte that
+         * would not fit ends the call with status {@code 06} instead of being
+         * consumed and discarded. Reading no further is the oracle's behavior -
+         * libcob refuses the record as soon as its record area overflows - and
+         * it is what keeps the call terminating: a stream that delivers no
+         * {@code LF} and never ends, a character device or a pipe with a live
+         * writer, would otherwise be consumed forever. For a file, refusing
+         * early and draining first are the same load, because the caller stops
+         * reading and closes the file on {@code 06} [file_editor.cob:202-206],
+         * so the bytes left unread have no reader. A final record that end of
+         * file cuts short, with no {@code LF} of its own, is still a
          * record.</p>
          *
          * <p>A {@code CR} is held <em>pending</em> rather than stored: if the
@@ -327,29 +335,33 @@ final class LineSequentialFile {
          * opens, the caller storing it as 1,024 bytes once trailing spaces are
          * removed.</p>
          *
-         * <p>The finish sequence fixes the precedence of the two statuses: the
-         * over-limit {@code 06} is raised first, then the {@code 06} for a file
-         * whose final byte is a bare {@code CR}, and only a record within the
-         * limit is scanned byte by byte. An embedded {@code CR}, or any other
-         * unacceptable control byte, therefore yields {@code 09} only where the
-         * record has not already yielded {@code 06}.</p>
+         * <p>Length is judged before content, which fixes the precedence of the
+         * two statuses: the over-limit {@code 06} is raised in the read loop
+         * itself, the {@code 06} for a file whose final byte is a bare
+         * {@code CR} on the way out of that loop, and only a record that
+         * reached its delimiter within the limit is scanned byte by byte. An
+         * embedded {@code CR}, or any other unacceptable control byte,
+         * therefore yields {@code 09} only where the record has not already
+         * yielded {@code 06} - including where the byte that overflowed the
+         * record area was itself the first unacceptable one.</p>
          *
          * @return the record without its delimiter, the empty string for a blank
          *         line, or {@code null} at end of file with nothing consumed -
          *         the {@code io-status} {@code 10} that ends the read loop
          *         [file_editor.cob:190]
          * @throws FileStatusException status {@code 06} when the record is
-         *                             longer than {@link #RECORD_SIZE} bytes or
-         *                             the file's final byte is a bare
-         *                             {@code CR}; status {@code 09} when a
-         *                             record within that limit retains an
+         *                             longer than {@link #RECORD_SIZE} bytes -
+         *                             raised at the first byte beyond that
+         *                             limit, leaving the rest of the record
+         *                             unread - or when the file's final byte is
+         *                             a bare {@code CR}; status {@code 09} when
+         *                             a record within that limit retains an
          *                             unacceptable control byte
          * @throws IOException the underlying read failed; the caller maps this
          *                     to status {@code 30}
          */
         String readRecord() throws FileStatusException, IOException {
             int retained = 0;
-            boolean overLimit = false;
             boolean any = false;
             boolean endedAtEof = false;
             boolean pendingCr = false;
@@ -374,26 +386,31 @@ final class LineSequentialFile {
                 // is stored and the last one is held in turn.
                 if (pendingCr) {
                     pendingCr = false;
-                    any = true;
-                    if (retained < RECORD_SIZE) {
-                        buf[retained++] = (byte) CARRIAGE_RETURN;
-                    } else {
-                        overLimit = true;
+                    if (retained == RECORD_SIZE) {
+                        throw new FileStatusException(STATUS_RECORD_OVERFLOW);
                     }
+                    any = true;
+                    buf[retained++] = (byte) CARRIAGE_RETURN;
                 }
                 if (b == CARRIAGE_RETURN) {
+                    // Held rather than stored, and held before the record area
+                    // is consulted: a CR that turns out to be the delimiter's
+                    // own must not overflow a record that ends at exactly
+                    // RECORD_SIZE bytes.
                     pendingCr = true;
                     continue;
                 }
-                any = true;
-                if (retained < RECORD_SIZE) {
-                    buf[retained++] = (byte) b;
-                } else {
-                    overLimit = true;
+                // The byte belongs in the record, so the record area decides:
+                // one that does not fit is the record being longer than the
+                // area, which the oracle refuses here rather than after reading
+                // to the delimiter. The test is for a full area, never a
+                // nearly-full one, so the RECORD_SIZE-th byte is still stored
+                // and it is the next byte that is refused.
+                if (retained == RECORD_SIZE) {
+                    throw new FileStatusException(STATUS_RECORD_OVERFLOW);
                 }
-            }
-            if (overLimit) {
-                throw new FileStatusException(STATUS_RECORD_OVERFLOW);
+                any = true;
+                buf[retained++] = (byte) b;
             }
             if (endedAtEof && pendingCr) {
                 throw new FileStatusException(STATUS_RECORD_OVERFLOW);

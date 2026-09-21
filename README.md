@@ -54,6 +54,35 @@ August 2026 security fixes, so install a `17.0.20.1` or later build first:
 Homebrew's `temurin@17` cask and the Debian/Ubuntu `openjdk-17-jdk-headless`
 package both carry it once the package index is current.
 
+The build and acceptance runs behind this project were made on Eclipse Temurin
+`17.0.20+8`, the July 2026 critical patch update, which is one critical
+security patch update behind the baseline above. That lag is an accepted,
+recorded risk rather than an oversight, on the following grounds.
+
+The August 2026 update fixes three vulnerabilities present in `17.0.20`:
+`CVE-2026-60589` in the Security component (CVSS 3.1 base score 3.7),
+`CVE-2026-61308` in Networking, reachable over HTTP (6.8), and
+`CVE-2026-70907` in JSSE, reachable over TLS, a partial denial of service; Red
+Hat bundles the three as advisory `RHSA-2026:55781`. Each of them is reachable
+only through a network-facing part of the JDK, and this editor has no network
+surface: it opens no socket, speaks no protocol, and names no `java.net`,
+`javax.net` or `javax.crypto` class. `grep -rn` over `src/` finds no such
+reference, and `javap -p -c` over the seven compiled classes shows them using
+only `java.io`, `java.lang`, `java.nio`, `java.util` and one `java.security`
+class, `SecureRandom`, which names temporary files. The three vulnerabilities
+are therefore unreachable by this program, and no source or `pom.xml` change is
+involved in clearing them: the compiler targets release 17, whose bytecode a
+JDK patch update leaves untouched, so a host that moves to `17.0.20.1` only has
+to rebuild. The prerequisite above stays `17.0.20.1` or later for anyone
+installing a JDK.
+
+That acceptance covers running and building this program, and not the one step
+of the workflow that does reach the network: Maven's own plugin resolution over
+TLS on the build JDK, noted above. Keep that step off a lagging JDK either by
+building on a `17.0.20.1` or later JDK, or by building offline with
+`mvn -o -B clean package -DskipTests=false` once the three plugins are in the
+local repository.
+
 From this directory:
 
 ```sh
