@@ -1,17 +1,19 @@
-COBC ?= cobc
-COBFLAGS ?= -Wall -debug
+MVN ?= mvn
+JAVA ?= java
+JAR := target/file-editor.jar
+SOURCES := $(wildcard src/main/java/com/example/fileeditor/*.java)
 
 .PHONY: all run test clean
-all: file_editor
+all: $(JAR)
 
-file_editor: file_editor.cob
-	$(COBC) -x -free $(COBFLAGS) -o $@ $<
+$(JAR): pom.xml $(SOURCES)
+	$(MVN) -q -B -DskipTests package
 
-run: file_editor
-	./file_editor
+run: $(JAR)
+	$(JAVA) -jar $(JAR)
 
-test: file_editor
+test: $(JAR)
 	python3 tests/test_editor.py
 
 clean:
-	$(RM) file_editor
+	$(MVN) -q -B clean
